@@ -3,6 +3,7 @@ import contextlib
 import datetime
 import functools
 import socket
+import struct
 import traceback
 import typing
 import unittest
@@ -1345,3 +1346,421 @@ class MaxMessageSizeTest(WebSocketBaseTestCase):
         self.assertEqual(ws.close_reason, "message too big")
         # TODO: Needs tests of messages split over multiple
         # continuation frames.
+
+
+def _client_frame(fin: bool, opcode: int, payload: bytes) -> bytes:
+    """Build a masked client-to-server frame for tests using a raw socket."""
+    first = (0x80 if fin else 0) | opcode
+    n = len(payload)
+    if n < 126:
+        header = bytes([first, 0x80 | n])
+    elif n <= 0xFFFF:
+        header = struct.pack("!BBH", first, 0x80 | 126, n)
+    else:
+        header = struct.pack("!BBQ", first, 0x80 | 127, n)
+    # A zero mask means the masked payload is identical to the original.
+    return header + b"\x00\x00\x00\x00" + payload
+
+
+class StreamingTestHandler(TestWebSocketHandler):
+    """Server-side handler that records streaming message events."""
+
+    def initialize(
+        self,
+        events: typing.List[typing.Any],
+        end_future: "Future[None] | None" = None,
+        chunk_gate: "asyncio.Event | None" = None,
+        pings: typing.List[bytes] | None = None,
+        **kwargs: typing.Any,
+    ) -> None:
+        super().initialize(**kwargs)
+        self.events = events
+        self.end_future = end_future
+        self.chunk_gate = chunk_gate
+        self.pings = pings
+
+    def on_message_begin(self, opcode: int) -> None:
+        self.events.append(("begin", opcode))
+
+    async def on_message_chunk(self, chunk: str | bytes) -> None:
+        self.events.append(("chunk", chunk))
+        if self.chunk_gate is not None:
+            await self.chunk_gate.wait()
+
+    def on_message_end(self) -> None:
+        self.events.append("end")
+        if self.end_future is not None and not self.end_future.done():
+            self.end_future.set_result(None)
+
+    def on_ping(self, data: bytes) -> None:
+        if self.pings is not None:
+            self.pings.append(data)
+
+    def on_close(self) -> None:
+        self.events.append(("close", self.streaming_message_in_progress))
+        super().on_close()
+
+
+class StreamingServerTest(WebSocketBaseTestCase):
+    """Tests for WebSocketHandler's on_message_* streaming hooks."""
+
+    READ_CHUNK_SIZE = 4
+
+    def get_app(self) -> Application:
+        self.events: typing.List[typing.Any] = []
+        self.pings: typing.List[bytes] = []
+        self.end_future: Future[None] = Future()
+        self.close_future: Future[typing.Any] = Future()
+        self.chunk_gate = asyncio.Event()
+        self.chunk_gate.set()
+        handler_args = dict(
+            events=self.events,
+            end_future=self.end_future,
+            close_future=self.close_future,
+            pings=self.pings,
+        )
+        return Application(
+            [
+                ("/stream", StreamingTestHandler, handler_args),
+                (
+                    "/compressed_stream",
+                    StreamingTestHandler,
+                    dict(handler_args, compression_options={}),
+                ),
+                (
+                    "/backpressure",
+                    StreamingTestHandler,
+                    dict(handler_args, chunk_gate=self.chunk_gate),
+                ),
+            ],
+            websocket_read_chunk_size=self.READ_CHUNK_SIZE,
+        )
+
+    def _chunks(self, events: typing.List[typing.Any]) -> typing.List[typing.Any]:
+        return [data for kind, data in events[1:-1] if kind == "chunk"]
+
+    @gen_test
+    def test_single_binary_frame_streamed_in_chunks(self) -> None:
+        ws = yield self.ws_connect("/stream")
+        payload = bytes(range(50))
+        ws.write_message(payload, binary=True)
+        yield self.end_future
+        self.assertEqual(self.events[0], ("begin", 2))
+        self.assertEqual(self.events[-1], "end")
+        chunks = self._chunks(self.events)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertIsInstance(chunk, bytes)
+            self.assertLessEqual(len(chunk), self.READ_CHUNK_SIZE)
+        self.assertEqual(b"".join(chunks), payload)
+
+    @gen_test
+    def test_text_chunks_never_split_multibyte_chars(self) -> None:
+        ws = yield self.ws_connect("/stream")
+        # Every character is 3 bytes in UTF-8, so 4-byte reads land in
+        # the middle of a character almost all the time.
+        payload = "中文测试" * 20
+        ws.write_message(payload)
+        yield self.end_future
+        self.assertEqual(self.events[0], ("begin", 1))
+        chunks = self._chunks(self.events)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertIsInstance(chunk, str)
+        self.assertEqual("".join(chunks), payload)
+
+    @gen_test
+    def test_fragmented_message_with_interleaved_ping(self) -> None:
+        stream = IOStream(socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0))
+        yield stream.connect(("127.0.0.1", self.get_http_port()))
+        stream.write(
+            b"GET /stream HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            b"Sec-WebSocket-Version: 13\r\n"
+            b"Sec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==\r\n\r\n"
+        )
+        # First fragment, then a ping (allowed between fragments),
+        # then the final continuation.
+        stream.write(_client_frame(False, 0x1, b"abc"))
+        stream.write(_client_frame(True, 0x9, b"p"))
+        stream.write(_client_frame(True, 0x0, b"def"))
+        yield self.end_future
+        self.assertEqual(
+            self.events,
+            [
+                ("begin", 1),
+                ("chunk", "abc"),
+                ("chunk", "def"),
+                "end",
+            ],
+        )
+        self.assertEqual(self.pings, [b"p"])
+        stream.close()
+
+    @gen_test
+    def test_slow_consumer_backpressure(self) -> None:
+        ws = yield self.ws_connect("/backpressure")
+        self.chunk_gate.clear()
+        ws.write_message(b"x" * 20, binary=True)
+        # First chunk is delivered, then reading must stop until the
+        # consumer catches up instead of buffering the whole frame.
+        yield gen.sleep(0.1)
+        self.assertEqual(len(self.events), 2)
+        self.assertEqual(self.events[0], ("begin", 2))
+        self.assertEqual(self.events[1], ("chunk", b"xxxx"))
+        self.chunk_gate.set()
+        yield self.end_future
+        self.assertEqual(b"".join(self._chunks(self.events)), b"x" * 20)
+
+    @gen_test
+    def test_compressed_message_streamed(self) -> None:
+        ws = yield self.ws_connect("/compressed_stream", compression_options={})
+        payload = "abcdefgh" * 500
+        ws.write_message(payload)
+        yield self.end_future
+        self.assertEqual(self.events[0], ("begin", 1))
+        self.assertEqual("".join(self._chunks(self.events)), payload)
+        self.assertEqual(self.events[-1], "end")
+
+    @gen_test
+    def test_disconnect_mid_message_is_distinguishable(self) -> None:
+        stream = IOStream(socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0))
+        yield stream.connect(("127.0.0.1", self.get_http_port()))
+        stream.write(
+            b"GET /stream HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            b"Sec-WebSocket-Version: 13\r\n"
+            b"Sec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==\r\n\r\n"
+        )
+        stream.write(_client_frame(False, 0x2, b"abc"))
+        yield gen.sleep(0.1)
+        self.assertNotIn("end", self.events)
+        stream.close()
+        yield self.close_future
+        # on_message_end never ran; on_close reports the in-progress
+        # message, so a truncated receive is distinguishable from a
+        # complete one.
+        self.assertEqual(self.events[0], ("begin", 2))
+        self.assertIn(("chunk", b"abc"), self.events)
+        self.assertNotIn("end", self.events)
+        self.assertEqual(self.events[-1], ("close", True))
+
+    @gen_test
+    def test_unknown_data_opcode_aborts_connection(self) -> None:
+        stream = IOStream(socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0))
+        yield stream.connect(("127.0.0.1", self.get_http_port()))
+        stream.write(
+            b"GET /stream HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            b"Sec-WebSocket-Version: 13\r\n"
+            b"Sec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==\r\n\r\n"
+        )
+        # Opcode 3 is an undefined non-control opcode; the connection
+        # must fail without any message callbacks running.
+        stream.write(_client_frame(True, 0x3, b"xyz"))
+        yield self.close_future
+        self.assertEqual(self.events, [("close", False)])
+        stream.close()
+
+
+class StreamingSizeLimitTest(WebSocketBaseTestCase):
+    def get_app(self) -> Application:
+        self.end_future: Future[None] = Future()
+        self.close_future: Future[typing.Any] = Future()
+        self.events: typing.List[typing.Any] = []
+        return Application(
+            [
+                (
+                    "/stream",
+                    StreamingTestHandler,
+                    dict(
+                        events=self.events,
+                        end_future=self.end_future,
+                        close_future=self.close_future,
+                    ),
+                )
+            ],
+            websocket_read_chunk_size=4,
+            websocket_max_message_size=32,
+        )
+
+    @gen_test
+    def test_streamed_message_over_limit(self) -> None:
+        ws = yield self.ws_connect("/stream")
+        ws.write_message(b"z" * 100, binary=True)
+        resp = yield ws.read_message()
+        self.assertIsNone(resp)
+        self.assertEqual(ws.close_code, 1009)
+        self.assertNotIn("end", self.events)
+
+
+class FragmentedBinaryHandler(TestWebSocketHandler):
+    def on_message(self, message: str | bytes) -> None:
+        conn = self.ws_connection
+        assert conn is not None
+        # Binary message split into two fragments with a ping in
+        # between (the client must answer the ping automatically).
+        conn._write_frame(False, 0x2, b"abc")
+        conn._write_frame(True, 0x9, b"q")
+        conn._write_frame(True, 0x0, b"def")
+
+
+class TruncatedStreamHandler(TestWebSocketHandler):
+    def on_message(self, message: str | bytes) -> None:
+        conn = self.ws_connection
+        assert conn is not None
+        conn._write_frame(False, 0x2, b"abc")
+        self.close(1001, "going away")
+
+
+class EmptyMessagesHandler(TestWebSocketHandler):
+    def on_message(self, message: str | bytes) -> None:
+        self.write_message(b"", binary=True)
+        self.write_message("")
+        self.close(1000, "bye")
+
+
+class StreamingClientTest(WebSocketBaseTestCase):
+    """Tests for WebSocketClientConnection.read_message_stream."""
+
+    def get_app(self) -> Application:
+        self.close_future: Future[None] = Future()
+        return Application(
+            [
+                ("/echo", EchoHandler, dict(close_future=self.close_future)),
+                (
+                    "/compressed_echo",
+                    EchoHandler,
+                    dict(close_future=self.close_future, compression_options={}),
+                ),
+                ("/fragmented", FragmentedBinaryHandler),
+                ("/truncated", TruncatedStreamHandler),
+                ("/empty", EmptyMessagesHandler),
+            ]
+        )
+
+    async def _read_all(self, stream: typing.Any) -> typing.List[typing.Any]:
+        chunks = []
+        while True:
+            chunk = await stream.read_chunk()
+            if chunk is None:
+                return chunks
+            chunks.append(chunk)
+
+    @gen_test
+    def test_client_stream_text(self) -> None:
+        ws = yield self.ws_connect("/echo", read_chunk_size=7)
+        msg = "abcdefghij" * 5
+        ws.write_message(msg)
+        stream = yield ws.read_message_stream()
+        assert stream is not None
+        self.assertFalse(stream.binary)
+        self.assertEqual(stream.message_type, 1)
+        chunks = yield self._read_all(stream)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertIsInstance(chunk, str)
+            self.assertLessEqual(len(chunk), 7)
+        self.assertEqual("".join(chunks), msg)
+
+    @gen_test
+    async def test_client_stream_binary_async_for(self) -> None:
+        ws = await self.ws_connect("/echo", read_chunk_size=7)
+        msg = bytes(range(60))
+        ws.write_message(msg, binary=True)
+        stream = await ws.read_message_stream()
+        assert stream is not None
+        self.assertTrue(stream.binary)
+        self.assertEqual(stream.message_type, 2)
+        chunks: typing.List[typing.Any] = []
+        async for chunk in stream:
+            chunks.append(chunk)
+        self.assertEqual(b"".join(chunks), msg)
+        # The completed stream returns None on further reads.
+        again = await stream.read_chunk()
+        self.assertIsNone(again)
+
+    @gen_test
+    def test_client_message_boundaries(self) -> None:
+        ws = yield self.ws_connect("/echo", read_chunk_size=7)
+        ws.write_message("first")
+        first = yield ws.read_message_stream()
+        assert first is not None
+        self.assertEqual("".join((yield self._read_all(first))), "first")
+        ws.write_message("second-message")
+        second = yield ws.read_message_stream()
+        assert second is not None
+        self.assertEqual("".join((yield self._read_all(second))), "second-message")
+        ws.close()
+        gone = yield ws.read_message_stream()
+        self.assertIsNone(gone)
+
+    @gen_test
+    def test_client_empty_messages(self) -> None:
+        ws = yield self.ws_connect("/empty", read_chunk_size=7)
+        ws.write_message("go")
+        binary_stream = yield ws.read_message_stream()
+        assert binary_stream is not None
+        self.assertTrue(binary_stream.binary)
+        self.assertIsNone((yield binary_stream.read_chunk()))
+        text_stream = yield ws.read_message_stream()
+        assert text_stream is not None
+        self.assertFalse(text_stream.binary)
+        self.assertIsNone((yield text_stream.read_chunk()))
+        # Server closed after the two empty messages.
+        gone = yield ws.read_message_stream()
+        self.assertIsNone(gone)
+
+    @gen_test
+    def test_client_fragmented_with_ping(self) -> None:
+        ws = yield self.ws_connect("/fragmented", read_chunk_size=7)
+        ws.write_message("go")
+        stream = yield ws.read_message_stream()
+        assert stream is not None
+        self.assertTrue(stream.binary)
+        self.assertEqual((yield self._read_all(stream)), [b"abc", b"def"])
+
+    @gen_test
+    def test_client_mid_message_disconnect(self) -> None:
+        ws = yield self.ws_connect("/truncated", read_chunk_size=7)
+        ws.write_message("go")
+        stream = yield ws.read_message_stream()
+        assert stream is not None
+        self.assertEqual((yield stream.read_chunk()), b"abc")
+        with self.assertRaises(WebSocketClosedError):
+            yield stream.read_chunk()
+        self.assertEqual(ws.close_code, 1001)
+        # After the interrupted stream, the next stream read returns
+        # None immediately instead of hanging.
+        self.assertIsNone((yield ws.read_message_stream()))
+
+    @gen_test
+    def test_client_compressed_stream(self) -> None:
+        ws = yield self.ws_connect(
+            "/compressed_echo", compression_options={}, read_chunk_size=7
+        )
+        msg = "abcdefgh" * 500
+        ws.write_message(msg)
+        stream = yield ws.read_message_stream()
+        assert stream is not None
+        self.assertFalse(stream.binary)
+        self.assertEqual("".join((yield self._read_all(stream))), msg)
+
+    @gen_test
+    def test_client_cannot_mix_with_read_message(self) -> None:
+        ws = yield self.ws_connect("/echo")
+        ws.write_message("buffered")
+        # Let the whole message arrive in read_queue.
+        yield gen.sleep(0.1)
+        with self.assertRaises(RuntimeError):
+            yield ws.read_message_stream()
+
+    @gen_test
+    def test_client_cannot_mix_with_callback(self) -> None:
+        ws = yield websocket_connect(
+            "ws://127.0.0.1:%d/echo" % self.get_http_port(),
+            on_message_callback=lambda message: None,
+        )
+        self.conns_to_close.append(ws)
+        with self.assertRaises(RuntimeError):
+            yield ws.read_message_stream()

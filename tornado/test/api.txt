@@ -1123,7 +1123,7 @@ tornado.web.url: alias of tornado.routing.URLSpec
 [tornado.websocket]
 tornado.websocket.WebSocketClientConnection: class(tornado.simple_httpclient._HTTPConnection)
 tornado.websocket.WebSocketClientConnection.__del__: method(self)
-tornado.websocket.WebSocketClientConnection.__init__: method(self, request, on_message_callback=None, compression_options=None, ping_interval=None, ping_timeout=None, max_message_size=10485760, subprotocols=None, resolver=None)
+tornado.websocket.WebSocketClientConnection.__init__: method(self, request, on_message_callback=None, compression_options=None, ping_interval=None, ping_timeout=None, max_message_size=10485760, subprotocols=None, resolver=None, read_chunk_size=65536)
 tornado.websocket.WebSocketClientConnection.chunks: attribute
 tornado.websocket.WebSocketClientConnection.client: attribute
 tornado.websocket.WebSocketClientConnection.close: method(self, code=None, reason=None)
@@ -1146,15 +1146,19 @@ tornado.websocket.WebSocketClientConnection.max_buffer_size: attribute
 tornado.websocket.WebSocketClientConnection.max_header_size: attribute
 tornado.websocket.WebSocketClientConnection.on_connection_close: method(self)
 tornado.websocket.WebSocketClientConnection.on_message: method(self, message)
+tornado.websocket.WebSocketClientConnection.on_message_begin: method(self, opcode)
+tornado.websocket.WebSocketClientConnection.on_message_chunk: method(self, data)
+tornado.websocket.WebSocketClientConnection.on_message_end: method(self)
 tornado.websocket.WebSocketClientConnection.on_ping: method(self, data)
 tornado.websocket.WebSocketClientConnection.on_pong: method(self, data)
-tornado.websocket.WebSocketClientConnection.on_ws_connection_close: method(self, close_code=None, close_reason=None)
+tornado.websocket.WebSocketClientConnection.on_ws_connection_close: method(self, close_code=None, close_reason=None, message_in_progress=False)
 tornado.websocket.WebSocketClientConnection.params: attribute
 tornado.websocket.WebSocketClientConnection.parsed: attribute
 tornado.websocket.WebSocketClientConnection.parsed_hostname: attribute
 tornado.websocket.WebSocketClientConnection.ping: method(self, data=b'')
 tornado.websocket.WebSocketClientConnection.protocol: attribute
 tornado.websocket.WebSocketClientConnection.read_message: method(self, callback=None)
+tornado.websocket.WebSocketClientConnection.read_message_stream: method(self)
 tornado.websocket.WebSocketClientConnection.read_queue: attribute
 tornado.websocket.WebSocketClientConnection.reason: attribute
 tornado.websocket.WebSocketClientConnection.release_callback: attribute
@@ -1181,20 +1185,32 @@ tornado.websocket.WebSocketHandler.max_message_size: property
 tornado.websocket.WebSocketHandler.on_close: method(self)
 tornado.websocket.WebSocketHandler.on_connection_close: method(self)
 tornado.websocket.WebSocketHandler.on_message: method(self, message)
+tornado.websocket.WebSocketHandler.on_message_begin: method(self, opcode)
+tornado.websocket.WebSocketHandler.on_message_chunk: method(self, chunk)
+tornado.websocket.WebSocketHandler.on_message_end: method(self)
 tornado.websocket.WebSocketHandler.on_ping: method(self, data)
 tornado.websocket.WebSocketHandler.on_pong: method(self, data)
-tornado.websocket.WebSocketHandler.on_ws_connection_close: method(self, close_code=None, close_reason=None)
+tornado.websocket.WebSocketHandler.on_ws_connection_close: method(self, close_code=None, close_reason=None, message_in_progress=False)
 tornado.websocket.WebSocketHandler.open: method(self, *args, **kwargs)
 tornado.websocket.WebSocketHandler.open_args: attribute
 tornado.websocket.WebSocketHandler.open_kwargs: attribute
 tornado.websocket.WebSocketHandler.ping: method(self, data=b'')
 tornado.websocket.WebSocketHandler.ping_interval: property
 tornado.websocket.WebSocketHandler.ping_timeout: property
+tornado.websocket.WebSocketHandler.read_chunk_size: property
 tornado.websocket.WebSocketHandler.select_subprotocol: method(self, subprotocols)
 tornado.websocket.WebSocketHandler.selected_subprotocol: property
 tornado.websocket.WebSocketHandler.set_nodelay: method(self, value)
+tornado.websocket.WebSocketHandler.streaming_message_in_progress: attribute
 tornado.websocket.WebSocketHandler.write_message: method(self, message, binary=False)
 tornado.websocket.WebSocketHandler.ws_connection: attribute
+tornado.websocket.WebSocketMessageStream: class()
+tornado.websocket.WebSocketMessageStream.__aiter__: method(self)
+tornado.websocket.WebSocketMessageStream.__anext__: method(self)
+tornado.websocket.WebSocketMessageStream.__init__: method(self, conn, binary)
+tornado.websocket.WebSocketMessageStream.binary: attribute
+tornado.websocket.WebSocketMessageStream.message_type: property
+tornado.websocket.WebSocketMessageStream.read_chunk: method(self)
 tornado.websocket.WebSocketProtocol: class(abc.ABC)
 tornado.websocket.WebSocketProtocol.__init__: method(self, handler)
 tornado.websocket.WebSocketProtocol.accept_connection: method(self, handler)
@@ -1239,7 +1255,7 @@ tornado.websocket.WebSocketProtocol13.stream: attribute
 tornado.websocket.WebSocketProtocol13.write_message: method(self, message, binary=False)
 tornado.websocket.WebSocketProtocol13.write_ping: method(self, data)
 tornado.websocket.de_dupe_gen_log: data
-tornado.websocket.websocket_connect: function(url, callback=None, connect_timeout=None, on_message_callback=None, compression_options=None, ping_interval=None, ping_timeout=None, max_message_size=10485760, subprotocols=None, resolver=None)
+tornado.websocket.websocket_connect: function(url, callback=None, connect_timeout=None, on_message_callback=None, compression_options=None, ping_interval=None, ping_timeout=None, max_message_size=10485760, subprotocols=None, resolver=None, read_chunk_size=65536)
 
 [tornado.wsgi]
 tornado.wsgi.HTTPRequest: alias of tornado.httputil.HTTPServerRequest

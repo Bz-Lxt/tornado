@@ -14,6 +14,7 @@ defined in `RFC 6455 <http://tools.ietf.org/html/rfc6455>`_.
 import abc
 import asyncio
 import base64
+import codecs
 import functools
 import hashlib
 import logging
@@ -68,17 +69,32 @@ class _Decompressor(Protocol):
     def decompress(self, data: bytes, max_length: int) -> bytes:
         pass
 
+    def flush(self) -> bytes:
+        pass
+
 
 class _WebSocketDelegate(Protocol):
     # The common base interface implemented by WebSocketHandler on
     # the server side and WebSocketClientConnection on the client
     # side.
     def on_ws_connection_close(
-        self, close_code: int | None = None, close_reason: str | None = None
+        self,
+        close_code: int | None = None,
+        close_reason: str | None = None,
+        message_in_progress: bool = False,
     ) -> None:
         pass
 
     def on_message(self, message: str | bytes) -> Optional["Awaitable[None]"]:
+        pass
+
+    def on_message_begin(self, opcode: int) -> Optional["Awaitable[None]"]:
+        pass
+
+    def on_message_chunk(self, data: str | bytes) -> Optional["Awaitable[None]"]:
+        pass
+
+    def on_message_end(self) -> Optional["Awaitable[None]"]:
         pass
 
     def on_ping(self, data: bytes) -> None:
@@ -97,6 +113,12 @@ class _WebSocketDelegate(Protocol):
 
 
 _default_max_message_size = 10 * 1024 * 1024
+# Incoming message payloads are read in chunks of at most this many bytes
+# (before decompression). Streaming the reads means a slow consumer only has
+# to buffer one chunk at a time instead of the whole message, and a single
+# (unfragmented) frame is delivered in several chunks the same way as a
+# fragmented one.
+_default_read_chunk_size = 64 * 1024
 
 # Reads of frames that have already arrived complete without returning
 # control to the IOLoop, so a peer that sends frames faster than we can
@@ -124,8 +146,12 @@ class WebSocketClosedError(WebSocketError):
     pass
 
 
-class _DecompressTooLargeError(Exception):
-    pass
+class _WebSocketAborted(Exception):
+    """Internal signal that the connection was aborted while reading.
+
+    Raised after `WebSocketProtocol._abort` has already been called, so the
+    frame loop only needs to stop and run its normal cleanup.
+    """
 
 
 class _WebSocketParams:
@@ -135,11 +161,13 @@ class _WebSocketParams:
         ping_timeout: float | None = None,
         max_message_size: int = _default_max_message_size,
         compression_options: dict[str, Any] | None = None,
+        read_chunk_size: int = _default_read_chunk_size,
     ) -> None:
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
         self.max_message_size = max_message_size
         self.compression_options = compression_options
+        self.read_chunk_size = read_chunk_size
 
 
 class WebSocketHandler(tornado.web.RequestHandler):
@@ -234,6 +262,21 @@ class WebSocketHandler(tornado.web.RequestHandler):
         self.close_code: int | None = None
         self.close_reason: str | None = None
         self._on_close_called = False
+        # Overriding on_message_chunk switches this handler from the
+        # buffered on_message API to streaming message delivery.
+        self._message_streaming = (
+            type(self).on_message_chunk is not WebSocketHandler.on_message_chunk
+        )
+        # Buffer used to reassemble chunks for the non-streaming on_message
+        # API. Text chunks (str) are kept in a list, binary chunks (bytes)
+        # in a bytearray.
+        self._message_chunks: list[str] | bytearray | None = None
+        #: True between `on_message_begin` and `on_message_end`, so
+        #: `on_close` can tell a mid-message disconnect from a clean one.
+        #: It is valid regardless of whether ``on_message_*`` were
+        #: overridden, so it also marks a message that was buffered for
+        #: delivery to `on_message`.
+        self.streaming_message_in_progress = False
 
     async def get(self, *args: Any, **kwargs: Any) -> None:
         self.open_args = args
@@ -335,6 +378,25 @@ class WebSocketHandler(tornado.web.RequestHandler):
         return cast(
             int,
             self.settings.get("websocket_max_message_size", _default_max_message_size),
+        )
+
+    @property
+    def read_chunk_size(self) -> int:
+        """Maximum number of bytes read at once from an incoming message.
+
+        Incoming message payloads (including a single, unfragmented frame)
+        are streamed in chunks of this size and passed to
+        `on_message_chunk` as they arrive, so even a slow consumer never
+        has to buffer a whole large message. The limit applies to the
+        compressed bytes on the wire when compression is in use.
+
+        Default is 64KiB.
+
+        .. versionadded:: 6.7
+        """
+        return cast(
+            int,
+            self.settings.get("websocket_read_chunk_size", _default_read_chunk_size),
         )
 
     def write_message(
@@ -453,6 +515,75 @@ class WebSocketHandler(tornado.web.RequestHandler):
            ``on_message`` can be a coroutine.
         """
         raise NotImplementedError
+
+    def on_message_begin(self, opcode: int) -> Awaitable[None] | None:
+        """Called once when a new message starts arriving.
+
+        ``opcode`` is ``1`` for a text message (chunks will be ``str``)
+        and ``2`` for a binary message (chunks will be ``bytes``). It
+        reflects the opcode of the first frame even when the message is
+        split across several fragmented frames.
+
+        To receive messages one chunk at a time instead of all at once in
+        `on_message`, override `on_message_chunk` (and optionally this
+        method and `on_message_end`). While streaming, the frame loop does
+        not read the next chunk until the awaitable returned by the
+        previous chunk has completed, which provides backpressure for slow
+        consumers.
+
+        .. versionadded:: 6.7
+        """
+        self.streaming_message_in_progress = True
+        if not self._message_streaming:
+            self._message_chunks = [] if opcode == 0x1 else bytearray()
+        return None
+
+    def on_message_chunk(self, chunk: str | bytes) -> Awaitable[None] | None:
+        """Called with each chunk of an incoming message.
+
+        Chunks are ``str`` for text messages (decoded incrementally as
+        UTF-8, so multibyte characters are never split) and ``bytes`` for
+        binary ones. This may be a coroutine; the next chunk (and the rest
+        of the frame stream, including control frames between fragments)
+        will not be read until it finishes.
+
+        Overriding this method replaces the buffered `on_message` API with
+        streaming delivery: messages are no longer assembled or passed to
+        `on_message`.
+
+        .. versionadded:: 6.7
+        """
+        chunks = self._message_chunks
+        if chunks is not None:
+            if isinstance(chunk, str):
+                assert isinstance(chunks, list)
+                chunks.append(chunk)
+            else:
+                assert isinstance(chunks, bytearray)
+                chunks.extend(chunk)
+        return None
+
+    def on_message_end(self) -> Awaitable[None] | None:
+        """Called once after all chunks of a message have been delivered.
+
+        If the connection is lost in the middle of a message this method
+        is not called; `on_close` is called instead, so the two can be
+        distinguished by checking
+        ``self.streaming_message_in_progress``.
+
+        .. versionadded:: 6.7
+        """
+        self.streaming_message_in_progress = False
+        if self._message_streaming:
+            return None
+        chunks = self._message_chunks
+        self._message_chunks = None
+        if isinstance(chunks, bytearray):
+            message: str | bytes = bytes(chunks)
+        else:
+            assert chunks is not None
+            message = "".join(chunks)
+        return self.on_message(message)
 
     def ping(self, data: str | bytes = b"") -> None:
         """Send ping frame to the remote end.
@@ -607,10 +738,16 @@ class WebSocketHandler(tornado.web.RequestHandler):
             self._break_cycles()
 
     def on_ws_connection_close(
-        self, close_code: int | None = None, close_reason: str | None = None
+        self,
+        close_code: int | None = None,
+        close_reason: str | None = None,
+        message_in_progress: bool = False,
     ) -> None:
         self.close_code = close_code
         self.close_reason = close_reason
+        # Use the protocol's authoritative state in case on_message_begin
+        # / on_message_end were overridden without calling super().
+        self.streaming_message_in_progress = message_in_progress
         self.on_connection_close()
 
     def _break_cycles(self) -> None:
@@ -630,6 +767,7 @@ class WebSocketHandler(tornado.web.RequestHandler):
                 ping_timeout=self.ping_timeout,
                 max_message_size=self.max_message_size,
                 compression_options=self.get_compression_options(),
+                read_chunk_size=self.read_chunk_size,
             )
             return WebSocketProtocol13(self, False, params)
         return None
@@ -809,6 +947,7 @@ class _PerMessageDeflateDecompressor:
         compression_options: dict[str, Any] | None = None,
     ) -> None:
         self._max_message_size = max_message_size
+        self._persistent = persistent
         if max_wbits is None:
             max_wbits = zlib.MAX_WBITS
         if not (8 <= max_wbits <= zlib.MAX_WBITS):
@@ -825,14 +964,41 @@ class _PerMessageDeflateDecompressor:
     def _create_decompressor(self) -> "_Decompressor":
         return zlib.decompressobj(-self._max_wbits)
 
-    def decompress(self, data: bytes) -> bytes:
-        decompressor = self._decompressor or self._create_decompressor()
-        result = decompressor.decompress(
-            data + b"\x00\x00\xff\xff", self._max_message_size
-        )
-        if decompressor.unconsumed_tail:
-            raise _DecompressTooLargeError()
-        return result
+    def begin_message(self) -> None:
+        """Reset the per-message decompression state.
+
+        With context takeover (``persistent=True``) the same decompressor
+        is reused across messages; otherwise a fresh one is created for
+        each message.
+        """
+        if self._decompressor is None:
+            self._decompressor = self._create_decompressor()
+
+    def end_message(self) -> None:
+        if not self._persistent:
+            self._decompressor = None
+
+    def inflate_step(self, data: bytes, max_length: int) -> tuple[bytes, bytes]:
+        """Inflate one bounded step of a compressed message.
+
+        Feeds ``data`` to zlib with ``max_length`` capping the output.
+        Returns ``(output, unconsumed_input)``; the unconsumed input
+        (non-empty only when the output cap was reached) must be fed
+        back in before any more wire data. Each call returns at most
+        ``max_length`` bytes, which keeps decompression memory bounded
+        for highly-compressible messages.
+
+        Raises ``zlib.error`` if the compressed data is invalid.
+        """
+        decompressor = self._decompressor
+        assert decompressor is not None
+        output = decompressor.decompress(data, max_length)
+        return output, decompressor.unconsumed_tail
+
+    def flush(self) -> bytes:
+        decompressor = self._decompressor
+        assert decompressor is not None
+        return decompressor.flush()
 
 
 class WebSocketProtocol13(WebSocketProtocol):
@@ -864,18 +1030,18 @@ class WebSocketProtocol13(WebSocketProtocol):
         WebSocketProtocol.__init__(self, handler)
         self.mask_outgoing = mask_outgoing
         self.params = params
-        self._final_frame = False
-        self._frame_opcode = None
-        self._masked_frame = None
-        self._frame_mask: bytes | None = None
-        self._frame_length = None
-        self._fragmented_message_buffer: bytearray | None = None
-        self._fragmented_message_opcode = None
         self._waiting: object = None
         self._compression_options = params.compression_options
         self._decompressor: _PerMessageDeflateDecompressor | None = None
         self._compressor: _PerMessageDeflateCompressor | None = None
-        self._frame_compressed: bool | None = None
+        # State of the data message currently being received. Control
+        # frames may be interleaved between the fragments of a data
+        # message, so this state spans multiple calls to _receive_frame.
+        self._message_opcode: int | None = None  # 0x1 (text) or 0x2 (binary)
+        self._message_wire_size = 0
+        self._message_size = 0
+        self._message_compressed = False
+        self._message_decoder: codecs.IncrementalDecoder | None = None
         # The total uncompressed size of all messages received or sent.
         # Unicode messages are encoded to utf8.
         # Only for testing; subject to change.
@@ -1159,29 +1325,32 @@ class WebSocketProtocol13(WebSocketProtocol):
                 if work >= _YIELD_THRESHOLD:
                     work = 0
                     await asyncio.sleep(0)
-        except StreamClosedError:
+        except (StreamClosedError, _WebSocketAborted):
             self._abort()
         finally:
-            self.handler.on_ws_connection_close(self.close_code, self.close_reason)
+            self.handler.on_ws_connection_close(
+                self.close_code,
+                self.close_reason,
+                message_in_progress=self._message_opcode is not None,
+            )
 
-    async def _read_bytes(self, n: int) -> bytes:
-        data = await self.stream.read_bytes(n)
-        self._wire_bytes_in += n
+    async def _read_bytes(self, n: int, partial: bool = False) -> bytes:
+        data = await self.stream.read_bytes(n, partial=partial)
+        self._wire_bytes_in += len(data)
         return data
 
     async def _receive_frame(self) -> None:
         # Read the frame header.
         data = await self._read_bytes(2)
         header, mask_payloadlen = struct.unpack("BB", data)
-        is_final_frame = header & self.FIN
+        is_final_frame = bool(header & self.FIN)
         reserved_bits = header & self.RSV_MASK
         opcode = header & self.OPCODE_MASK
-        opcode_is_control = opcode & 0x8
+        opcode_is_control = bool(opcode & 0x8)
         if self._decompressor is not None and opcode != 0:
-            # Compression flag is present in the first frame's header,
-            # but we can't decompress until we have all the frames of
-            # the message.
-            self._frame_compressed = bool(reserved_bits & self.RSV1)
+            # The compression flag is only present on the first frame's
+            # header, so remember it for the whole message.
+            self._message_compressed = bool(reserved_bits & self.RSV1)
             reserved_bits &= ~self.RSV1
         if reserved_bits:
             # client is using as-yet-undefined extensions; abort
@@ -1196,90 +1365,200 @@ class WebSocketProtocol13(WebSocketProtocol):
             self._abort()
             return
         if payloadlen < 126:
-            self._frame_length = payloadlen
+            pass
         elif payloadlen == 126:
             data = await self._read_bytes(2)
             payloadlen = struct.unpack("!H", data)[0]
         elif payloadlen == 127:
             data = await self._read_bytes(8)
             payloadlen = struct.unpack("!Q", data)[0]
-        new_len = payloadlen
-        if self._fragmented_message_buffer is not None:
-            new_len += len(self._fragmented_message_buffer)
-        if new_len > self.params.max_message_size:
-            self.close(1009, "message too big")
-            self._abort()
-            return
 
-        # Read the payload, unmasking if necessary.
-        if is_masked:
-            self._frame_mask = await self._read_bytes(4)
-        data = await self._read_bytes(payloadlen)
-        if is_masked:
-            assert self._frame_mask is not None
-            data = _websocket_mask(self._frame_mask, data)
-
-        # Decide what to do with this frame.
         if opcode_is_control:
-            # control frames may be interleaved with a series of fragmented
-            # data frames, so control frames must not interact with
-            # self._fragmented_*
             if not is_final_frame:
                 # control frames must not be fragmented
                 self._abort()
                 return
         elif opcode == 0:  # continuation frame
-            if self._fragmented_message_buffer is None:
+            if self._message_opcode is None:
                 # nothing to continue
                 self._abort()
                 return
-            self._fragmented_message_buffer.extend(data)
-            if is_final_frame:
-                opcode = self._fragmented_message_opcode
-                data = bytes(self._fragmented_message_buffer)
-                self._fragmented_message_buffer = None
-        else:  # start of new data message
-            if self._fragmented_message_buffer is not None:
+            self._message_wire_size += payloadlen
+            if self._message_wire_size > self.params.max_message_size:
+                self.close(1009, "message too big")
+                self._abort()
+                return
+        else:  # start of a new data message
+            if self._message_opcode is not None:
                 # can't start new message until the old one is finished
                 self._abort()
                 return
-            if not is_final_frame:
-                self._fragmented_message_opcode = opcode
-                self._fragmented_message_buffer = bytearray(data)
+            if opcode not in (0x1, 0x2):
+                # Opcode 3-7 are reserved for future non-control frames;
+                # receiving one is a protocol error (RFC 6455).
+                self._abort()
+                return
+            if payloadlen > self.params.max_message_size:
+                self.close(1009, "message too big")
+                self._abort()
+                return
 
-        if is_final_frame:
+        # Read the mask, if any.
+        frame_mask: bytes | None = None
+        if is_masked:
+            frame_mask = await self._read_bytes(4)
+
+        if opcode_is_control:
+            # Control frames are small and fully buffered. They may be
+            # interleaved between the fragments of a data message, so
+            # they are handled independently of the per-message state.
+            data = await self._read_bytes(payloadlen)
+            if frame_mask is not None:
+                data = _websocket_mask(frame_mask, data)
             handled_future = self._handle_message(opcode, data)
             if handled_future is not None:
                 await handled_future
+            return
+
+        if opcode != 0:
+            await self._begin_message(opcode, payloadlen)
+
+        # Stream the payload in bounded chunks. Each read returns as soon
+        # as some bytes are available (partial=True), but never more than
+        # read_chunk_size at a time, and the next chunk is not read until
+        # the delegate has processed this one, giving slow consumers
+        # end-to-end backpressure.
+        frame_mask_offset = 0
+        remaining = payloadlen
+        while remaining > 0:
+            n = min(remaining, self.params.read_chunk_size)
+            chunk = await self._read_bytes(n, partial=True)
+            if frame_mask is not None:
+                # The mask cycles over the frame's payload starting at
+                # offset zero, so rotate it for each chunk.
+                shift = frame_mask_offset % 4
+                mask = (
+                    frame_mask
+                    if shift == 0
+                    else (frame_mask[shift:] + frame_mask[:shift])
+                )
+                chunk = _websocket_mask(mask, chunk)
+            frame_mask_offset += len(chunk)
+            remaining -= len(chunk)
+            await self._message_payload_chunk(chunk, is_final_frame and remaining == 0)
+        if is_final_frame and payloadlen == 0:
+            # A zero-length final frame still has to flush the
+            # decompressor/text decoder (e.g. an empty text message).
+            await self._message_payload_chunk(b"", True)
+
+        if is_final_frame:
+            await self._end_message()
+
+    async def _begin_message(self, opcode: int, payloadlen: int) -> None:
+        self._message_opcode = opcode
+        self._message_wire_size = payloadlen
+        self._message_size = 0
+        if opcode == 0x1:
+            self._message_decoder = codecs.getincrementaldecoder("utf-8")(
+                errors="strict"
+            )
+        else:
+            self._message_decoder = None
+        if self._message_compressed:
+            assert self._decompressor is not None
+            self._decompressor.begin_message()
+        callback = self._run_callback(self.handler.on_message_begin, opcode)
+        if callback is not None:
+            await callback
+
+    async def _message_payload_chunk(self, data: bytes, final: bool) -> None:
+        opcode = self._message_opcode
+        assert opcode is not None
+        if self._message_compressed:
+            assert self._decompressor is not None
+            if final:
+                data += b"\x00\x00\xff\xff"
+            # Inflate one bounded step at a time so a compression bomb
+            # is cut off as soon as max_message_size is exceeded,
+            # instead of after decompressing the whole message.
+            pending = data
+            try:
+                while pending:
+                    output, pending = self._decompressor.inflate_step(
+                        pending, self.params.read_chunk_size
+                    )
+                    if output:
+                        await self._deliver_message_chunk(output, opcode)
+                if final:
+                    output = self._decompressor.flush()
+                    if output:
+                        await self._deliver_message_chunk(output, opcode)
+            except zlib.error:
+                self._abort()
+                raise _WebSocketAborted()
+        elif data:
+            await self._deliver_message_chunk(data, opcode)
+        if final and opcode == 0x1:
+            # Flush any buffered multibyte tail and validate the stream.
+            assert self._message_decoder is not None
+            try:
+                payload = self._message_decoder.decode(b"", final=True)
+            except UnicodeDecodeError:
+                self._abort()
+                raise _WebSocketAborted()
+            if payload:
+                callback = self._run_callback(self.handler.on_message_chunk, payload)
+                if callback is not None:
+                    await callback
+
+    async def _deliver_message_chunk(self, chunk: bytes, opcode: int) -> None:
+        self._message_size += len(chunk)
+        self._message_bytes_in += len(chunk)
+        if self._message_size > self.params.max_message_size:
+            self.close(1009, "message too big after decompression")
+            self._abort()
+            raise _WebSocketAborted()
+        payload: str | bytes
+        if opcode == 0x1:
+            # Decode incrementally so a multibyte character split
+            # across chunks is never corrupted.
+            assert self._message_decoder is not None
+            try:
+                payload = self._message_decoder.decode(chunk)
+            except UnicodeDecodeError:
+                self._abort()
+                raise _WebSocketAborted()
+        else:
+            payload = chunk
+        if payload:
+            callback = self._run_callback(self.handler.on_message_chunk, payload)
+            if callback is not None:
+                await callback
+
+    async def _end_message(self) -> None:
+        if self._message_compressed:
+            assert self._decompressor is not None
+            self._decompressor.end_message()
+        self._message_opcode = None
+        self._message_wire_size = 0
+        self._message_size = 0
+        self._message_compressed = False
+        self._message_decoder = None
+        callback = self._run_callback(self.handler.on_message_end)
+        if callback is not None:
+            await callback
 
     def _handle_message(self, opcode: int, data: bytes) -> "Optional[Future[None]]":
-        """Execute on_message, returning its Future if it is a coroutine."""
+        """Execute a control-frame callback, returning its Future.
+
+        Data messages are streamed through on_message_begin/chunk/end and
+        never reach this method; it handles close, ping and pong frames,
+        which may be interleaved between fragments of a data message.
+        """
         if self.client_terminated:
             return None
 
-        if self._frame_compressed:
-            assert self._decompressor is not None
-            try:
-                data = self._decompressor.decompress(data)
-            except _DecompressTooLargeError:
-                self.close(1009, "message too big after decompression")
-                self._abort()
-                return None
-
-        if opcode == 0x1:
-            # UTF-8 data
-            self._message_bytes_in += len(data)
-            try:
-                decoded = data.decode("utf-8")
-            except UnicodeDecodeError:
-                self._abort()
-                return None
-            return self._run_callback(self.handler.on_message, decoded)
-        elif opcode == 0x2:
-            # Binary data
-            self._message_bytes_in += len(data)
-            return self._run_callback(self.handler.on_message, data)
-        elif opcode == 0x8:
+        if opcode == 0x8:
             # Close
             self.client_terminated = True
             if len(data) >= 2:
@@ -1451,6 +1730,16 @@ class WebSocketProtocol13(WebSocketProtocol):
             )
 
 
+class _MessageBeginEvent:
+    """Internal marker placed on the streaming queue at message start."""
+
+    def __init__(self, opcode: int) -> None:
+        self.binary = opcode == 0x2
+
+
+_MESSAGE_END = object()
+
+
 class WebSocketClientConnection(simple_httpclient._HTTPConnection):
     """WebSocket client connection.
 
@@ -1470,9 +1759,21 @@ class WebSocketClientConnection(simple_httpclient._HTTPConnection):
         max_message_size: int = _default_max_message_size,
         subprotocols: list[str] | None = None,
         resolver: Resolver | None = None,
+        read_chunk_size: int = _default_read_chunk_size,
     ) -> None:
         self.connect_future: Future[WebSocketClientConnection] = Future()
         self.read_queue: Queue[None | str | bytes] = Queue(1)
+        # Queue used by read_message_stream. Lazily created when that
+        # method is first called, so connections that use read_message or
+        # on_message_callback keep their original behavior.
+        self._streaming_queue: Queue[Any] | None = None
+        # Set once the connection is gone; makes read_message_stream
+        # return None after the close sentinel was consumed (e.g. by a
+        # WebSocketMessageStream that was interrupted mid-message).
+        self._streaming_closed = False
+        # Buffer used to reassemble chunks for read_message /
+        # on_message_callback when streaming reads are not in use.
+        self._message_chunks: list[str] | bytearray | None = None
         self.key = base64.b64encode(os.urandom(16))
         self._on_message_callback = on_message_callback
         self.close_code: int | None = None
@@ -1482,6 +1783,7 @@ class WebSocketClientConnection(simple_httpclient._HTTPConnection):
             ping_timeout=ping_timeout,
             max_message_size=max_message_size,
             compression_options=compression_options,
+            read_chunk_size=read_chunk_size,
         )
 
         scheme, sep, rest = request.url.partition(":")
@@ -1550,12 +1852,23 @@ class WebSocketClientConnection(simple_httpclient._HTTPConnection):
     def on_connection_close(self) -> None:
         if not self.connect_future.done():
             self.connect_future.set_exception(StreamClosedError())
-        self._on_message(None)
+        if self._streaming_queue is not None:
+            # The queue may be full of an unconsumed event; enqueue the
+            # close sentinel as a separate task so it always lands after
+            # the last chunk without blocking the frame loop.
+            if not self._streaming_closed:
+                self._streaming_closed = True
+                asyncio.ensure_future(self._streaming_queue.put(None))
+        else:
+            self._on_message(None)
         self.tcp_client.close()
         super().on_connection_close()
 
     def on_ws_connection_close(
-        self, close_code: int | None = None, close_reason: str | None = None
+        self,
+        close_code: int | None = None,
+        close_reason: str | None = None,
+        message_in_progress: bool = False,
     ) -> None:
         self.close_code = close_code
         self.close_reason = close_reason
@@ -1646,6 +1959,90 @@ class WebSocketClientConnection(simple_httpclient._HTTPConnection):
         else:
             return self.read_queue.put(message)
 
+    def on_message_begin(self, opcode: int) -> Awaitable[None] | None:
+        queue = self._streaming_queue
+        if queue is not None:
+            return queue.put(_MessageBeginEvent(opcode))
+        self._message_chunks = [] if opcode == 0x1 else bytearray()
+        return None
+
+    def on_message_chunk(self, data: str | bytes) -> Awaitable[None] | None:
+        queue = self._streaming_queue
+        if queue is not None:
+            # Backpressure: the frame loop awaits the put, so at most one
+            # chunk is buffered here while the application is slow.
+            return queue.put(data)
+        chunks = self._message_chunks
+        assert chunks is not None
+        if isinstance(data, str):
+            assert isinstance(chunks, list)
+            chunks.append(data)
+        else:
+            assert isinstance(chunks, bytearray)
+            chunks.extend(data)
+        return None
+
+    def on_message_end(self) -> Awaitable[None] | None:
+        queue = self._streaming_queue
+        if queue is not None:
+            return queue.put(_MESSAGE_END)
+        chunks = self._message_chunks
+        self._message_chunks = None
+        if isinstance(chunks, bytearray):
+            message: None | str | bytes = bytes(chunks)
+        else:
+            assert chunks is not None
+            message = "".join(chunks)
+        return self._on_message(message)
+
+    async def read_message_stream(
+        self,
+    ) -> Optional["WebSocketMessageStream"]:
+        """Wait for the next message and return it as a stream of chunks.
+
+        Like `read_message`, but instead of buffering the whole message
+        the returned `WebSocketMessageStream` yields its contents one
+        chunk at a time, so large messages can be processed without
+        holding them all in memory. Text messages yield ``str`` chunks
+        and binary messages yield ``bytes`` chunks; single-frame and
+        fragmented messages are handled identically (control frames such
+        as pings may still be interleaved between fragments).
+
+        Returns ``None`` if the connection is closed before the next
+        message starts. If the connection is lost in the middle of a
+        message, reading from the returned stream raises
+        `WebSocketClosedError`, which distinguishes an interrupted
+        message from one that was received completely.
+
+        This method must be used instead of `read_message` from the
+        start of the connection; the two cannot be mixed. It is also
+        incompatible with ``on_message_callback``.
+
+        .. versionadded:: 6.7
+        """
+        if self._on_message_callback is not None:
+            raise RuntimeError(
+                "read_message_stream cannot be used with on_message_callback"
+            )
+        if self._streaming_queue is None:
+            if self.read_queue.qsize() > 0:
+                raise RuntimeError(
+                    "cannot use read_message_stream after read_message has "
+                    "buffered messages; choose one style per connection"
+                )
+            self._streaming_queue = Queue(1)
+        elif self._streaming_closed and self._streaming_queue.qsize() == 0:
+            # The close sentinel has already been consumed (for example
+            # by a stream that was interrupted mid-message), so there will
+            # never be another message.
+            return None
+        event = await self._streaming_queue.get()
+        if event is None:
+            return None
+        if isinstance(event, _MessageBeginEvent):
+            return WebSocketMessageStream(self, event.binary)
+        raise WebSocketError("protocol error: expected the start of a message")
+
     def ping(self, data: bytes = b"") -> None:
         """Send ping frame to the remote end.
 
@@ -1694,6 +2091,65 @@ class WebSocketClientConnection(simple_httpclient._HTTPConnection):
         app_log.error("Uncaught exception %s", value, exc_info=(typ, value, tb))
 
 
+class WebSocketMessageStream:
+    """A single incoming WebSocket message, read one chunk at a time.
+
+    Returned by `WebSocketClientConnection.read_message_stream`. Each
+    call to `read_chunk` returns the next chunk (``str`` for a text
+    message, ``bytes`` for a binary one) and applies backpressure to the
+    connection: the next chunk is not read off the socket until the
+    previous one has been consumed, so a large message only needs one
+    chunk of memory at a time.
+
+    The class also implements the async iterator protocol, so messages
+    can be consumed with ``async for``.
+
+    .. versionadded:: 6.7
+    """
+
+    def __init__(self, conn: "WebSocketClientConnection", binary: bool) -> None:
+        self._conn = conn
+        #: True for binary messages, False for text messages.
+        self.binary = binary
+        self._finished = False
+
+    @property
+    def message_type(self) -> int:
+        """The WebSocket opcode of this message: 1 for text, 2 for binary."""
+        return 0x2 if self.binary else 0x1
+
+    async def read_chunk(self) -> Union[str, bytes, None]:
+        """Return the next chunk of the message, or None when complete.
+
+        Raises `WebSocketClosedError` if the connection is lost before
+        the message has been received completely. After that (or after
+        a previous call returned None), subsequent calls return None.
+        """
+        if self._finished:
+            return None
+        queue = self._conn._streaming_queue
+        assert queue is not None
+        event = await queue.get()
+        if event is None:
+            self._finished = True
+            raise WebSocketClosedError(
+                "connection closed before the message was received completely"
+            )
+        if event is _MESSAGE_END:
+            self._finished = True
+            return None
+        return cast("Union[str, bytes]", event)
+
+    def __aiter__(self) -> "WebSocketMessageStream":
+        return self
+
+    async def __anext__(self) -> Union[str, bytes]:
+        chunk = await self.read_chunk()
+        if chunk is None:
+            raise StopAsyncIteration
+        return chunk
+
+
 def websocket_connect(
     url: str | httpclient.HTTPRequest,
     callback: Callable[["Future[WebSocketClientConnection]"], None] | None = None,
@@ -1705,6 +2161,7 @@ def websocket_connect(
     max_message_size: int = _default_max_message_size,
     subprotocols: list[str] | None = None,
     resolver: Resolver | None = None,
+    read_chunk_size: int = _default_read_chunk_size,
 ) -> "Awaitable[WebSocketClientConnection]":
     """Client-side websocket support.
 
@@ -1724,6 +2181,18 @@ def websocket_connect(
             if msg is None: break
             # Do something with msg
 
+    Large messages can instead be streamed one chunk at a time with
+    `~.WebSocketClientConnection.read_message_stream`::
+
+        conn = yield websocket_connect(url, read_chunk_size=64 * 1024)
+        while True:
+            stream = yield conn.read_message_stream()
+            if stream is None: break
+            chunks = []
+            async for chunk in stream:
+                chunks.append(chunk)
+                # Slow consumers apply backpressure automatically.
+
     In the callback style, pass an ``on_message_callback`` to
     ``websocket_connect``. In both styles, a message of ``None``
     indicates that the connection has been closed.
@@ -1732,6 +2201,12 @@ def websocket_connect(
     subprotocols. The selected protocol may be found on the
     ``selected_subprotocol`` attribute of the connection object
     when the connection is complete.
+
+    ``read_chunk_size`` bounds the amount of incoming data buffered
+    while a message is being streamed (the default is 64KiB); it also
+    controls how much data is read at once internally, so a single
+    unfragmented frame is delivered in several chunks just like a
+    fragmented one.
 
     .. versionchanged:: 3.2
        Also accepts ``HTTPRequest`` objects in place of urls.
@@ -1751,6 +2226,10 @@ def websocket_connect(
 
     .. versionchanged:: 6.3
        Added the ``resolver`` argument.
+
+    .. versionchanged:: 6.7
+       Added the ``read_chunk_size`` argument and support for streaming
+       reads through ``read_message_stream``.
 
     .. deprecated:: 6.5
        The ``callback`` argument is deprecated and will be removed in Tornado 7.0.
@@ -1778,6 +2257,7 @@ def websocket_connect(
         max_message_size=max_message_size,
         subprotocols=subprotocols,
         resolver=resolver,
+        read_chunk_size=read_chunk_size,
     )
     if callback is not None:
         warnings.warn(
